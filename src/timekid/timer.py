@@ -1,15 +1,20 @@
 import time
+import logging
+import warnings
 from types import TracebackType
 from typing import (Self, Type, Optional, Callable, Generator,
-                    Awaitable, AsyncGenerator, ParamSpec, TypeVar)
+                    Awaitable, ParamSpec, TypeVar)
 from functools import wraps
 from enum import StrEnum
-from contextlib import contextmanager, asynccontextmanager
+from contextlib import contextmanager
 
 __author__ = "Peter Vestereng Larsen"
 __version__ = "0.1.0"
 __license__ = "MIT"
 __email__ = "p.vesterenglarsen@gmail.com"
+
+__all__ = ['Timer', 'StopWatch', 'TimerContext', 'Status', 'BaseTimer']
+logger = logging.getLogger('timekid')
 
 P = ParamSpec(name='P')
 P_async = ParamSpec(name='P_async')
@@ -55,6 +60,22 @@ class StopWatch(BaseTimer):
         self._end_time: Optional[float] = None
         self._precision = precision
         self._status: Status = Status.PENDING
+
+    def __eq__(self, other: object) -> bool:
+        """Value-ish equality intended mainly for tests.
+
+        Notes:
+            - Compares *recorded* state only (cached elapsed/laps), not wall-clock time.
+            - While RUNNING, elapsed time is dynamic; equality will typically be False
+              unless both objects are identical in recorded state.
+        """
+        if not isinstance(other, StopWatch):
+            return NotImplemented
+        return (
+            self._precision == other._precision
+            and self._status == other._status
+            and self._elapsed_time == other._elapsed_time
+        )
         
     @property
     def elapsed_time(self) -> float:
@@ -97,7 +118,19 @@ class StopWatch(BaseTimer):
         self._end_time = None
         self._elapsed_time = None
         self._status = Status.PENDING
-        
+
+    def __enter__(self) -> Self:
+        self.start()
+        return self
+
+    def __exit__(self,
+                 exc_type: Optional[Type[BaseException]],
+                 exc_value: Optional[BaseException],
+                 traceback: Optional[TracebackType]) -> None:
+        self.stop()
+        if exc_type is not None:
+            self._status = Status.FAILED
+
     def __repr__(self) -> str:
         parts = [f'status={self.status}']
         if self._start_time is not None:
@@ -112,7 +145,7 @@ class TimerContext(BaseTimer):
     While TimerContext can be used directly, the recommended approach is to access it via the Timer class (e.g., `timer["my_key"]`).
     """
     def __init__(self, precision: Optional[int], name: Optional[str] = None, verbose: bool = False,
-                 log_func: Callable[[str], None] = print) -> None:
+                 log_func: Callable[[str], None] = logger.info) -> None:
         self._name: str = str(name) if name is not None else 'Unnamed'
         self._precision = precision
         self._elapsed_time: Optional[float] = None
@@ -124,6 +157,22 @@ class TimerContext(BaseTimer):
         self._entered: bool = False
         self._verbose: bool = verbose
         self._log_func: Callable[[str], None] = log_func if verbose else _noop
+
+    def __eq__(self, other: object) -> bool:
+        """Value-ish equality intended mainly for tests.
+
+        Compares recorded state (name/status/precision + cached elapsed + laps).
+        Does not attempt to compare live running time.
+        """
+        if not isinstance(other, TimerContext):
+            return NotImplemented
+        return (
+            self._name == other._name
+            and self._precision == other._precision
+            and self._status == other._status
+            and self._elapsed_time == other._elapsed_time
+            and self._laps == other._laps
+        )
     
     @property
     def elapsed_time(self) -> float:
@@ -215,7 +264,7 @@ class TimerContext(BaseTimer):
 
 class Timer:
     def __init__(self, precision: Optional[int] = None, verbose: bool = False,
-                 log_func: Callable[[str], None] = print) -> None:
+                 log_func: Callable[[str], None] = logger.info) -> None:
         self._precision = precision
         self._verbose = verbose
         self._log_func = log_func
@@ -332,7 +381,7 @@ class Timer:
         return self._registry.get(key, [])
     
     @contextmanager
-    def anonymous(self, name: Optional[str] = None, verbose: bool = False, log_func: Callable[[str], None] = print) -> Generator[TimerContext, None, None]:
+    def anonymous(self, name: Optional[str] = None, verbose: bool = False, log_func: Callable[[str], None] = logger.info) -> Generator[TimerContext, None, None]:
         with TimerContext(self.precision, name=name, verbose=verbose, log_func=log_func) as ctx:
             yield ctx
             
@@ -358,8 +407,8 @@ class Timer:
 
         return sorted(result, key=lambda item: item[1].elapsed_time, reverse=reverse)
         
-    def timeit(self, func: Callable[P, R],
-               *args: P.args, **kwargs: P.kwargs) -> TimerContext:
+    def time_call(self, func: Callable[P, R],
+                  *args: P.args, **kwargs: P.kwargs) -> TimerContext:
         """Time a single invocation of a function.
 
         Similar to the timed decorator but for one-off timing.
@@ -377,19 +426,47 @@ class Timer:
         with self[key] as ctx:
             func(*args, **kwargs)
         return ctx
-    
-    def benchmark(self, func: Callable[P, R], num_iter: int,
-                  *args: P.args, **kwargs: P.kwargs) -> list[TimerContext]:
-        # Benchmark runs anonymously and doesn't persist in registry
-        # Single warmup run to handle JIT compilation or lazy initialization
-        func(*args, **kwargs)
 
-        str_key: str = f"{func.__name__} benchmark"
+    def timeit(self, func: Callable[P, R],
+               *args: P.args, **kwargs: P.kwargs) -> TimerContext:
+        """Deprecated alias for :meth:`time_call`.
+
+        Note:
+            This method name can be confused with Python's stdlib ``timeit`` module.
+            Prefer ``time_call`` for clarity.
+        """
+        warnings.warn(
+            "Timer.timeit() is deprecated; use Timer.time_call() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.time_call(func, *args, **kwargs)
+    
+    def benchmark(self, func: Callable[P, R], num_iter: int, warmup: int = 1,
+                  *args: P.args, store: bool = False, key: Optional[str] = None,
+                  **kwargs: P.kwargs) -> list[TimerContext]:
+        """Benchmark a function over many iterations.
+
+        By default, benchmark results are *not* persisted in the registry (they
+        run via :meth:`anonymous`). Set ``store=True`` to store each iteration
+        under the key ``"<func_name> benchmark"`` by default, or provide ``key``
+        to store under a custom registry key.
+        """
+        # Warmup runs to handle JIT compilation or lazy initialization
+        for _ in range(warmup):
+            func(*args, **kwargs)
+
+        default_key: str = f"{func.__name__} benchmark"
+        benchmark_key: str = key if key is not None else default_key
         results: list[TimerContext] = []
         for _ in range(num_iter):
-            with self.anonymous(name = str_key) as ctx:
-                func(*args, **kwargs)
-                results.append(ctx)
+            if store:
+                with self[benchmark_key] as ctx:
+                    func(*args, **kwargs)
+            else:
+                with self.anonymous(name=benchmark_key) as ctx:
+                    func(*args, **kwargs)
+            results.append(ctx)
         return results
         
     def __getitem__(self, key: str) -> TimerContext:
@@ -421,10 +498,7 @@ class Timer:
 
         return context
 
-    @asynccontextmanager
-    async def _async_context(self, key: str) -> AsyncGenerator[TimerContext, None]:
-        with self[key] as ctx:
-            yield ctx
-        
+    # (removed) _async_context: unused internal helper; async timings use sync TimerContext.
+
     def __repr__(self) -> str:
         return f"Timer(precision={self.precision}, times={self.times})"

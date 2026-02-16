@@ -1,8 +1,8 @@
 # Timekid
 
-A high-precision timing and profiling library for Python with support for context managers, decorators, lap timing, and benchmarking.
+A timing and profiling library for Python with support for context managers, decorators, lap timing, and benchmarking.
 
-[![Tests](https://github.com/PeterVL02/timer/actions/workflows/test.yml/badge.svg)](https://github.com/PeterVL02/timer/actions/workflows/test.yml)
+[![Tests](https://github.com/pvl-clawbot/timekid/actions/workflows/test.yml/badge.svg)](https://github.com/pvl-clawbot/timekid/actions/workflows/test.yml)
 
 ## Features
 
@@ -13,9 +13,7 @@ A high-precision timing and profiling library for Python with support for contex
 - **Historical Tracking**: All timing invocations are stored in lists for statistical analysis
 - **Benchmarking**: Run functions multiple times with warmup support
 - **Async Support**: Full support for async functions with `@timer.timed_async`
-- **Type Safe**: Comprehensive type hints using modern Python typing features
 - **Zero Dependencies**: Uses only Python standard library
-- **High Precision**: Uses `time.perf_counter()` for accurate timing
 
 ## Installation
 
@@ -24,14 +22,42 @@ A high-precision timing and profiling library for Python with support for contex
 Install with uv (recommended):
 ```bash
 uv pip install -e .
+python -c "import timekid; print('timekid import OK')"
 ```
 
 Or with pip:
 ```bash
 pip install -e .
+python -c "import timekid; print('timekid import OK')"
+```
+
+Verify the expected import works:
+```bash
+python -c "import timekid; print('timekid OK')"
 ```
 
 ## Quick Start
+
+### Low-overhead timing (FastTimer)
+
+If you need minimal overhead and are doing a large number of measurements, use `FastTimer`.
+It stores raw integer nanoseconds internally and only converts to seconds when you report.
+
+```python
+from timekid.fast import FastTimer
+
+ft = FastTimer()
+key = ft.key_id("hot_loop")  # do string->id once
+
+for _ in range(1000):
+    tok = ft.start(key)
+    # ... hot code ...
+    ft.stop(tok)
+
+print(ft.times_s(precision=6)[key][:5])
+```
+
+(Planned) a future optional Rust backend can implement the same API for even lower overhead.
 
 ### Basic Timing with Context Manager
 
@@ -115,13 +141,27 @@ from timekid.timer import Timer
 
 timer = Timer()
 
-# Benchmark a function with 1000 iterations
-results = timer.benchmark(my_function, num_iter=1000, arg1, arg2)
+# Benchmark a function with 1000 iterations (not stored in the registry by default)
+results = timer.benchmark(my_function, num_iter=1000, warmup=1, arg1, arg2)
+
+# Optionally persist benchmark runs in the timer registry
+timer.benchmark(my_function, num_iter=1000, arg1, arg2, store=True)
+print(len(timer.times['my_function benchmark']))
+
+# Optionally provide a custom registry key when storing
+custom_key = 'bench.my_function.hot_path'
+timer.benchmark(my_function, num_iter=1000, arg1, arg2, store=True, key=custom_key)
+print(len(timer.times[custom_key]))
 
 # Analyze results
 times = [r.elapsed_time for r in results]
 avg_time = sum(times) / len(times)
 print(f"Average: {avg_time:.6f}s")
+
+# If you want benchmark iterations to appear in timer.times / timer.contexts:
+# (stored under "<func_name> benchmark")
+_ = timer.benchmark(my_function, num_iter=1000, warmup=1, store=True, arg1, arg2)
+print(len(timer.times["my_function benchmark"]))
 ```
 
 ### Simple StopWatch
@@ -232,9 +272,12 @@ Timer(precision: Optional[int] = None, verbose: bool = False, log_func: Callable
 - `get(key: str)` - Get all contexts matching a key
 - `status(key: str)` - Get list of statuses for a key
 - `sorted(reverse: bool = False)` - Get timers sorted by elapsed time
-- `timeit(func, *args, **kwargs)` - Time a single function call
-- `benchmark(func, num_iter: int, *args, **kwargs)` - Benchmark function with multiple iterations
+- `time_call(func, *args, **kwargs)` - Time a single function call (preferred name)
+- `timeit(func, *args, **kwargs)` - Deprecated alias for `time_call`
+- `benchmark(func, num_iter: int, warmup: int = 1, *args, store: bool = False, key: Optional[str] = None, **kwargs)` - Benchmark function with multiple iterations (optionally stored in registry; custom key supported)
 - `anonymous(name, verbose, log_func)` - Create anonymous timer context (not stored in registry)
+
+> Note: `Timer.timeit(...)` has been replaced by `Timer.time_call(...)` for clarity and to avoid confusion with the stdlib `timeit` module.
 
 ### TimerContext Class
 
